@@ -1,123 +1,117 @@
-from flask import Flask, render_template, request, redirect, url_for, flash
-import os
-from werkzeug.utils import secure_filename
+# app.py
+from flask import Flask, render_template, request
 import sqlite3
-from datetime import datetime
+import os
 from tensorflow.keras.models import load_model
 import numpy as np
-from PIL import Image
-import io
+import cv2
+from datetime import datetime
 
 # --- Configuration ---
-UPLOAD_FOLDER = 'uploads'
-ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg'}
-DATABASE = 'database.db'
-MODEL_PATH = 'face_emotionModel.h5'  # place the trained model here
+UPLOAD_FOLDER = os.path.join('static', 'uploads')
+DB_FILE = 'database.db'
 
+# Create folders if missing
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+# Initialize Flask
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-app.secret_key = os.environ.get('FLASK_SECRET', 'dev_secret_change_me')
 
-# Load the trained model (lazy load when first request)
-model = None
-EMOTIONS = ['Angry', 'Disgust', 'Fear', 'Happy', 'Sad', 'Surprise', 'Neutral']
+# Load trained model
+MODEL_PATH = 'face_emotionModel.h5'
+model = load_model(MODEL_PATH)
 
-
-def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+# Emotion labels (same order as training)
+EMOTIONS = ["happy", "sad", "surprised", "angry", "neutral"]
 
 
-def get_db_connection():
-    conn = sqlite3.connect(DATABASE)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
+# --- Database setup ---
 def init_db():
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute('''
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        fullname TEXT,
-        email TEXT,
-        matric TEXT,
-        filename TEXT,
-        predicted_emotion TEXT,
-        timestamp TEXT
-    )
-    ''')
+    """Create database if not already present"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT,
+                    email TEXT,
+                    department TEXT,
+                    image_filename TEXT,
+                    prediction TEXT,
+                    date_uploaded TEXT
+                )''')
     conn.commit()
     conn.close()
 
 
-def preprocess_image(image_bytes, target_size=(48,48)):
-    # Convert bytes to grayscale 48x48 as used in FER2013 model
-    image = Image.open(io.BytesIO(image_bytes)).convert('L')
-    image = image.resize(target_size)
-    arr = np.asarray(image, dtype=np.float32)
-    arr = arr / 255.0
-    arr = arr.reshape(1, target_size[0], target_size[1], 1)
-    return arr
+def save_to_db(name, email, department, image_filename, prediction):
+    """Save user info + image + prediction to DB"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    date_uploaded = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute("INSERT INTO users (name, email, department, image_filename, prediction, date_uploaded) VALUES (?, ?, ?, ?, ?, ?)",
+              (name, email, department, image_filename, prediction, date_uploaded))
+    conn.commit()
+    conn.close()
 
 
-@app.route('/', methods=['GET'])
-def index():
+# --- Image preprocessing ---
+def preprocess_image(filepath):
+    """Read image and prepare it for the model"""
+    img = cv2.imread(filepath, cv2.IMREAD_GRAYSCALE)
+    img = cv2.resize(img, (48, 48))  # same size as training
+    img = img / 255.0
+    img = img.reshape(1, 48, 48, 1)
+    return img
+
+
+# --- Flask routes ---
+@app.route('/')
+def home():
     return render_template('index.html')
 
 
-@app.route('/submit', methods=['POST'])
-def submit():
-    global model
-    fullname = request.form.get('fullname', '').strip()
-    email = request.form.get('email', '').strip()
-    matric = request.form.get('matric', '').strip()
+@app.route('/predict', methods=['POST'])
+def predict():
+    if 'image' not in request.files:
+        return render_template('index.html', result="No image uploaded!")
 
-    if 'photo' not in request.files:
-        flash('No file part')
-        return redirect(url_for('index'))
+    # Get form data
+    name = request.form['name']
+    email = request.form['email']
+    department = request.form['department']
+    file = request.files['image']
 
-    file = request.files['photo']
     if file.filename == '':
-        flash('No selected file')
-        return redirect(url_for('index'))
+        return render_template('index.html', result="No file selected!")
 
-    if file and allowed_file(file.filename):
-        filename = secure_filename(f"{datetime.utcnow().strftime('%Y%m%d%H%M%S')}_" + file.filename)
-        os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
-        path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        file_bytes = file.read()
-        with open(path, 'wb') as f:
-            f.write(file_bytes)
+    # Save uploaded image
+    filepath = os.path.join(app.config['UPLOAD_FOLDER'], file.filename)
+    file.save(filepath)
 
-        # Load model if not already loaded
-        if model is None:
-            if not os.path.exists(MODEL_PATH):
-                flash('Model file not found on server. Please upload face_emotionModel.h5 to the project root.')
-                return redirect(url_for('index'))
-            model = load_model(MODEL_PATH)
+    # Preprocess and predict
+    img_array = preprocess_image(filepath)
+    preds = model.predict(img_array)
+    emotion_index = np.argmax(preds)
+    predicted_emotion = EMOTIONS[emotion_index]
 
-        # Preprocess and predict
-        x = preprocess_image(file_bytes)
-        preds = model.predict(x)
-        emotion_idx = int(np.argmax(preds, axis=1)[0])
-        emotion = EMOTIONS[emotion_idx]
+    # Create readable response
+    messages = {
+        "happy": "You look happy! Keep smiling 😊",
+        "sad": "You are frowning. Why are you sad?",
+        "surprised": "Wow! You look surprised 😲",
+        "angry": "You seem angry 😠. Take it easy!",
+        "neutral": "You look calm and neutral."
+    }
+    result_text = messages.get(predicted_emotion, predicted_emotion)
 
-        # Save to database
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute('INSERT INTO users (fullname, email, matric, filename, predicted_emotion, timestamp) VALUES (?,?,?,?,?,?)',
-                    (fullname, email, matric, filename, emotion, datetime.utcnow().isoformat()))
-        conn.commit()
-        conn.close()
+    # Save info to database
+    save_to_db(name, email, department, file.filename, result_text)
 
-        return render_template('result.html', emotion=emotion, fullname=fullname, filename=filename)
-
-    else:
-        flash('File type not allowed. Please upload PNG/JPG/JPEG.')
-        return redirect(url_for('index'))
+    # Display result
+    return render_template('index.html', result=result_text, filename=file.filename)
 
 
-if name == '__main__':
+if __name__ == '__main__':
     init_db()
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    app.run(debug=True)
